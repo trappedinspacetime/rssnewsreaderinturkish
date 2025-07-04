@@ -15,25 +15,31 @@ import lxml.html
 import webbrowser
 import os
 import requests
+import configparser
+import validators
+import socket
 
 # Log ayarları
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 
+# Konfigürasyon dosyası ayarları
+CONFIG_DIR = os.path.expanduser("~/.config")
+CONFIG_FILE = os.path.join(CONFIG_DIR, "rss.ini")
+DEFAULT_RSS_URL = "https://www.gercekgundem.com/rss/"
+
 # Ses cihazını başlatmak için boş ses çal
 def initialize_audio():
     try:
-        #logger.debug("Ses cihazı başlatılıyor...")
         command = ["aplay", "-r", "22050", "-f", "S16_LE", "-t", "raw", "/dev/zero"]
         proc = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
-            proc.wait(timeout=2)
+            proc.wait(timeout=1)
         except subprocess.TimeoutExpired:
             proc.kill()
-            logger.warning("Ses cihazı başlatma denemesi zaman aşımına uğradı (zaman aşımı).")
+            logger.debug("Ses cihazı başlatma denemesi zaman aşımına uğradı, devam ediliyor.")
         except Exception as e:
             logger.error(f"aplay başlatma sürecinde hata: {e}")
-        #logger.debug("Ses cihazı başlatıldı (deneme yapıldı).")
     except FileNotFoundError:
         logger.error("aplay komutu bulunamadı. Lütfen aplay'in yüklü olduğundan emin olun.")
     except Exception as e:
@@ -52,7 +58,6 @@ def speak_text(text):
         escaped_text_for_shell = cleaned_text.replace("'", "'\"'\"'")
         quoted_text = f"'{escaped_text_for_shell}'"
 
-        # Model dosyalarının yolu ve indirme işlemi
         home_dir = os.path.expanduser("~")
         model_dir = os.path.join(home_dir, "piper-voices", "tr", "tr_TR", "fettah", "medium")
         os.makedirs(model_dir, exist_ok=True)
@@ -68,12 +73,11 @@ def speak_text(text):
             }
         }
 
-        # Dosyaları indirme (eğer yoksa)
         for file_type, file_info in model_files.items():
             if not os.path.exists(file_info["path"]):
                 logger.info(f"{file_type} dosyası indiriliyor: {file_info['url']}")
                 try:
-                    response = requests.get(file_info["url"], stream=True)
+                    response = requests.get(file_info["url"], stream=True, timeout=10)
                     response.raise_for_status()
                     with open(file_info["path"], "wb") as f:
                         for chunk in response.iter_content(chunk_size=8192):
@@ -83,18 +87,16 @@ def speak_text(text):
                     logger.error(f"{file_type} dosyası indirilemedi: {e}")
                     return
 
-        # Piper komutunu çalıştır
         piper_command = (
             f"echo {quoted_text} | piper "
             f"--model {model_files['model']['path']} "
             f"--config {model_files['config']['path']} "
-            "--length-scale 0.833 "
+            f"--length-scale 0.833 "
             "--output_raw"
         )
 
         piper_process = subprocess.Popen(piper_command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=False)
 
-        # ... (kalan kod aynı)
         try:
             audio_data, piper_stderr = piper_process.communicate(timeout=15)
         except subprocess.TimeoutExpired:
@@ -143,60 +145,102 @@ def speak_text(text):
     except Exception as e:
         logger.error(f"Seslendirme hatası: {e}")
 
-# RSS verilerini almak ve HTML'i temizlemek
-def get_rss_feed():
+# Konfigürasyon dosyasını oku ve varsayılan RSS adresini ekle
+def load_rss_feeds():
+    config = configparser.ConfigParser()
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+
+    if not os.path.exists(CONFIG_FILE):
+        config['RSS'] = {'feeds': DEFAULT_RSS_URL}
+        with open(CONFIG_FILE, 'w') as configfile:
+            config.write(configfile)
+        logger.info(f"Konfigürasyon dosyası oluşturuldu: {CONFIG_FILE}")
+    else:
+        config.read(CONFIG_FILE)
+        if 'RSS' not in config or 'feeds' not in config['RSS']:
+            config['RSS'] = {'feeds': DEFAULT_RSS_URL}
+            with open(CONFIG_FILE, 'w') as configfile:
+                config.write(configfile)
+            logger.info(f"Konfigürasyon dosyasına varsayılan RSS adresi eklendi.")
+
+    feeds = config['RSS'].get('feeds', DEFAULT_RSS_URL).split(',')
+    feeds = [feed.strip() for feed in feeds if feed.strip()]
+    if not feeds:
+        feeds = [DEFAULT_RSS_URL]
+    return feeds
+
+# Konfigürasyon dosyasına RSS feed'lerini kaydet
+def save_rss_feeds(feeds):
+    config = configparser.ConfigParser()
+    config['RSS'] = {'feeds': ','.join(feeds)}
+    with open(CONFIG_FILE, 'w') as configfile:
+        config.write(configfile)
+    logger.info(f"RSS feed'leri kaydedildi: {CONFIG_FILE}")
+
+# Ağ bağlantısını kontrol et
+def check_network():
     try:
-        feed = feedparser.parse("https://www.gercekgundem.com/rss/", request_headers={'User-agent': 'RSSReadScrollWindow'})
+        socket.create_connection(("8.8.8.8", 53), timeout=5)
+        return True
+    except OSError as e:
+        logger.debug(f"Ağ bağlantısı kontrolü başarısız: {e}")
+        return False
 
-        if feed.bozo:
-            logger.error(f"RSS ayrıştırma hatası: {feed.bozo_exception}")
-            return None
+# RSS verilerini almak ve HTML'i temizlemek
+def get_rss_feed(feeds, max_retries=3, initial_delay=5):
+    all_entries = []
+    for url in feeds:
+        for attempt in range(max_retries):
+            try:
+                feed = feedparser.parse(url, request_headers={'User-agent': 'RSSReadScrollWindow'})
+                if feed.bozo:
+                    logger.error(f"RSS ayrıştırma hatası ({url}): {feed.bozo_exception}")
+                    continue
 
-        entries = []
-        for entry in feed.entries:
-            if not (hasattr(entry, "title") and entry.title.strip()):
-                continue
+                for entry in feed.entries:
+                    if not (hasattr(entry, "title") and entry.title.strip()):
+                        continue
 
-            # Açıklama veya özet al
-            raw_description = getattr(entry, 'description', getattr(entry, 'summary', '')).strip()
-            if not raw_description:
-                description = "Açıklama bulunamadı."
-            else:
-                try:
-                    doc = lxml.html.fromstring(raw_description)
-                    for a_tag in doc.xpath('//a'):
-                        a_tag.drop_tree()
-                    h4_elements = doc.xpath('//h4')
-                    if h4_elements:
-                        description = h4_elements[0].text_content().strip()
-                    else:
-                        description = doc.text_content().strip()
-                    if not description:
+                    raw_description = getattr(entry, 'description', getattr(entry, 'summary', '')).strip()
+                    if not raw_description:
                         description = "Açıklama bulunamadı."
-                except Exception as e:
-                    logger.error(f"HTML ayrıştırma hatası: {e}")
-                    description = "Açıklama ayrıştırılamadı."
+                    else:
+                        try:
+                            doc = lxml.html.fromstring(raw_description)
+                            for a_tag in doc.xpath('//a'):
+                                a_tag.drop_tree()
+                            h4_elements = doc.xpath('//h4')
+                            if h4_elements:
+                                description = h4_elements[0].text_content().strip()
+                            else:
+                                description = doc.text_content().strip()
+                            if not description:
+                                description = "Açıklama bulunamadı."
+                        except Exception as e:
+                            logger.error(f"HTML ayrıştırma hatası: {e}")
+                            description = "Açıklama ayrıştırılamadı."
 
-            # Link al
-            link = getattr(entry, 'link', '').strip()
-            if not link:
-                logger.warning(f"Başlık için link bulunamadı: {entry.title[:50]}...")
+                    link = getattr(entry, 'link', '').strip()
+                    if not link:
+                        logger.warning(f"Başlık için link bulunamadı: {entry.title[:50]}...")
 
-            entries.append({
-                'title': entry.title.strip(),
-                'description': description,
-                'link': link
-            })
-
-        if not entries:
-            logger.warning("RSS akışında başlık bulunamadı.")
-            return None
-
-        #logger.debug(f"RSS verisi alındı ({len(entries)} başlık).")
-        return entries
-    except Exception as e:
-        logger.error(f"RSS alınırken hata: {e}")
+                    all_entries.append({
+                        'title': entry.title.strip(),
+                        'description': description,
+                        'link': link
+                    })
+                break
+            except Exception as e:
+                logger.error(f"RSS alınırken hata ({url}, deneme {attempt + 1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    delay = initial_delay * (2 ** attempt)
+                    logger.info(f"{delay} saniye sonra tekrar denenecek...")
+                    time.sleep(delay)
+                continue
+    if not all_entries:
+        logger.warning("RSS akışlarında başlık bulunamadı.")
         return None
+    return all_entries
 
 # Kayan metin penceresi
 class ScrollingTextWindow(Gtk.Window):
@@ -207,34 +251,28 @@ class ScrollingTextWindow(Gtk.Window):
     def __init__(self):
         super().__init__(title="Kayan Haberler")
 
-        # Pencere ayarları
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor()
         geometry = monitor.get_geometry()
         self.screen_width = geometry.width
-        #logger.debug(f"Ekran genişliği tespit edildi: {self.screen_width}")
 
         self.set_size_request(self.screen_width, 30)
         self.set_decorated(False)
         self.move(0, 0)
 
-        # Şeffaf arka plan
         screen = self.get_screen()
         visual = screen.get_rgba_visual()
         if visual and screen.is_composited():
             self.set_visual(visual)
             self.set_app_paintable(True)
-            #logger.debug("Şeffaf arka plan etkin.")
         else:
             logger.warning("Şeffaf arka plan desteklenmiyor, düz arka plan kullanılacak.")
             self.set_app_paintable(False)
 
-        # Çizim alanı
         self.drawing_area = Gtk.DrawingArea()
         self.add(self.drawing_area)
         self.drawing_area.connect("draw", self.on_draw)
         self.drawing_area.connect("size-allocate", self.on_size_allocate)
-        # Fare hareketi, tıklama ve ayrılma için olayları etkinleştir
         self.drawing_area.set_events(self.drawing_area.get_events() | 
                                     Gdk.EventMask.POINTER_MOTION_MASK | 
                                     Gdk.EventMask.BUTTON_PRESS_MASK |
@@ -243,33 +281,59 @@ class ScrollingTextWindow(Gtk.Window):
         self.drawing_area.connect("button-press-event", self.on_button_press)
         self.drawing_area.connect("leave-notify-event", self.on_leave_notify)
 
-        # Metin ve animasyon
+        self.rss_feeds = load_rss_feeds()
+
         self.entries = []
-        self.text_with_padding = ""
+        self.text_with_padding = ""  # Start with empty text
         self.title_pixel_positions = []
         self.total_text_band_width_px = 0
         self.x_position = self.screen_width
         self.speed = 4
         self.is_paused = False
+        self.network_available = False
+        self.initial_fetch_attempted = False
 
         self.connect("destroy", Gtk.main_quit)
-        #self.set_keep_above(True)
 
-        # Seslendirme takibi
         self.next_title_index_to_speak = 0
 
-        # Ses cihazını başlat
         threading.Thread(target=initialize_audio, daemon=True).start()
-
-        # RSS verisini ilk kez çek
-        threading.Thread(target=self.periodic_rss_fetch, daemon=True).start()
-
-        # Animasyon ve RSS güncelleme zamanlayıcıları
+        # Perform initial fetch in a separate thread to avoid blocking
+        threading.Thread(target=self.initial_fetch, daemon=True).start()
+        GLib.timeout_add(10000, self.check_network_and_fetch)  # Check every 10 seconds
         GLib.timeout_add(33, self.update_position)
-        GLib.timeout_add(600000, self.update_rss)
+
+    def initial_fetch(self):
+        # Perform initial network check and fetch
+        self.network_available = check_network()
+        if self.network_available:
+            logger.info("Başlangıçta ağ bağlantısı algılandı, RSS verisi alınıyor...")
+            entries = get_rss_feed(self.rss_feeds)
+            GLib.idle_add(self.update_text_in_gui, entries)
+        else:
+            logger.debug("Başlangıçta ağ bağlantısı yok, 10 saniye sonra hata mesajı gösterilecek.")
+            # Delay showing error message for 10 seconds
+            GLib.timeout_add(10000, self.show_initial_error)
+        self.initial_fetch_attempted = True
+
+    def show_initial_error(self):
+        if not self.entries and not self.network_available:
+            GLib.idle_add(self.update_text_in_gui, None)
+        return False  # One-shot timeout
+
+    def check_network_and_fetch(self):
+        was_available = self.network_available
+        self.network_available = check_network()
+        if self.network_available and not was_available:
+            logger.info("Ağ bağlantısı algılandı, RSS verisi alınıyor...")
+            self.update_rss()
+        elif not self.network_available:
+            logger.debug("Ağ bağlantısı yok, 10 saniye sonra tekrar kontrol edilecek.")
+            if was_available and self.entries:
+                GLib.idle_add(self.update_text_in_gui, None)
+        return True  # Keep the timeout active
 
     def on_size_allocate(self, widget, allocation):
-        #logger.debug(f"Pencere boyutu değişti: {allocation.width}x{allocation.height}. Piksel pozisyonları yeniden hesaplanıyor.")
         if self.entries:
             self.calculate_title_pixel_positions()
         elif "RSS verisi alınamadı" in self.text_with_padding:
@@ -283,21 +347,17 @@ class ScrollingTextWindow(Gtk.Window):
             description = self.entries[title_index]['description']
             self.drawing_area.set_tooltip_text(description)
             self.is_paused = True
-            #logger.debug(f"Başlık üzerine gelindi, kaydırma durdu. İndeks: {title_index}")
         else:
             self.drawing_area.set_tooltip_text(None)
             self.is_paused = False
             self.drawing_area.queue_draw()
-            #logger.debug("Fare başlık dışına (ayraç veya boşluk) çıktı, kaydırma devam ediyor.")
 
         return False
 
     def on_leave_notify(self, widget, event):
-        # Fare DrawingArea'dan çıktığında (ör. şeridin dışına)
         self.drawing_area.set_tooltip_text(None)
         self.is_paused = False
         self.drawing_area.queue_draw()
-        #logger.debug("Fare DrawingArea'dan çıktı, kaydırma devam ediyor.")
         return False
 
     def on_button_press(self, widget, event):
@@ -309,12 +369,133 @@ class ScrollingTextWindow(Gtk.Window):
                 if link:
                     try:
                         webbrowser.open(link)
-                        #logger.debug(f"URL açıldı: {link}")
                     except Exception as e:
                         logger.error(f"URL açma hatası: {e}")
                 else:
                     logger.warning("Tıklanan başlık için link bulunamadı.")
-        return False
+        elif event.button == 3:
+            self.show_context_menu(event)
+        return True
+
+    def show_context_menu(self, event):
+        menu = Gtk.Menu()
+
+        add_feed_item = Gtk.MenuItem(label="Yeni RSS Ekle")
+        add_feed_item.connect("activate", self.on_add_feed)
+        menu.append(add_feed_item)
+
+        manage_feeds_item = Gtk.MenuItem(label="RSS Listesini Yönet")
+        manage_feeds_item.connect("activate", self.on_manage_feeds)
+        menu.append(manage_feeds_item)
+
+        exit_item = Gtk.MenuItem(label="Kapat")
+        exit_item.connect("activate", self.on_exit)
+        menu.append(exit_item)
+
+        menu.show_all()
+        menu.popup(None, None, None, None, event.button, event.time)
+
+    def on_exit(self, widget):
+        Gtk.main_quit()
+
+    def on_add_feed(self, widget):
+        dialog = Gtk.Dialog(title="Yeni RSS Ekle", parent=self, flags=0)
+        dialog.add_buttons(Gtk.STOCK_CANCEL, Gtk.ResponseType.CANCEL, Gtk.STOCK_OK, Gtk.ResponseType.OK)
+        dialog.set_default_response(Gtk.ResponseType.OK)
+
+        entry = Gtk.Entry()
+        entry.set_placeholder_text("RSS URL'sini girin (örn. https://example.com/rss)")
+        entry.set_activates_default(True)
+        dialog.get_content_area().pack_start(entry, True, True, 0)
+        dialog.show_all()
+
+        response = dialog.run()
+        if response == Gtk.ResponseType.OK:
+            url = entry.get_text().strip()
+            if validators.url(url):
+                if url not in self.rss_feeds:
+                    self.rss_feeds.append(url)
+                    save_rss_feeds(self.rss_feeds)
+                    logger.info(f"Yeni RSS feed eklendi: {url}")
+                    self.update_rss()
+                else:
+                    logger.warning(f"Bu RSS feed zaten mevcut: {url}")
+            else:
+                logger.error(f"Geçersiz URL: {url}")
+        dialog.destroy()
+
+    def on_manage_feeds(self, widget):
+        dialog = Gtk.Dialog(title="RSS Listesini Yönet", parent=self, flags=0)
+        dialog.add_buttons(Gtk.STOCK_CLOSE, Gtk.ResponseType.CLOSE)
+        dialog.set_default_size(400, 300)
+
+        scrolled = Gtk.ScrolledWindow()
+        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        listbox = Gtk.ListBox()
+        scrolled.add(listbox)
+        dialog.get_content_area().pack_start(scrolled, True, True, 0)
+
+        adjustment = scrolled.get_vadjustment()
+
+        self.populate_feed_list(listbox, adjustment)
+
+        dialog.show_all()
+        dialog.run()
+        dialog.destroy()
+
+    def populate_feed_list(self, listbox, adjustment):
+        scroll_position = adjustment.get_value() if adjustment else 0
+
+        for child in listbox.get_children():
+            listbox.remove(child)
+
+        for index, feed in enumerate(self.rss_feeds):
+            row = Gtk.ListBoxRow()
+            hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            label = Gtk.Label(label=feed, xalign=0)
+
+            up_button = Gtk.Button()
+            up_button.set_image(Gtk.Image.new_from_icon_name("go-up", Gtk.IconSize.BUTTON))
+            up_button.set_sensitive(index > 0)
+            up_button.connect("clicked", self.on_move_feed, feed, listbox, -1, adjustment)
+
+            down_button = Gtk.Button()
+            down_button.set_image(Gtk.Image.new_from_icon_name("go-down", Gtk.IconSize.BUTTON))
+            down_button.set_sensitive(index < len(self.rss_feeds) - 1)
+            down_button.connect("clicked", self.on_move_feed, feed, listbox, 1, adjustment)
+
+            delete_button = Gtk.Button(label="Sil")
+            delete_button.connect("clicked", self.on_delete_feed, feed, listbox, adjustment)
+
+            hbox.pack_start(label, True, True, 0)
+            hbox.pack_end(delete_button, False, False, 0)
+            hbox.pack_end(down_button, False, False, 0)
+            hbox.pack_end(up_button, False, False, 0)
+            row.add(hbox)
+            listbox.add(row)
+
+        listbox.show_all()
+        if adjustment:
+            GLib.idle_add(adjustment.set_value, scroll_position)
+
+    def on_move_feed(self, button, feed, listbox, direction, adjustment):
+        index = self.rss_feeds.index(feed)
+        new_index = index + direction
+        if 0 <= new_index < len(self.rss_feeds):
+            self.rss_feeds.pop(index)
+            self.rss_feeds.insert(new_index, feed)
+            save_rss_feeds(self.rss_feeds)
+            logger.info(f"RSS feed taşındı: {feed} -> pozisyon {new_index}")
+            self.populate_feed_list(listbox, adjustment)
+            self.update_rss()
+
+    def on_delete_feed(self, button, feed, listbox, adjustment):
+        if feed in self.rss_feeds:
+            self.rss_feeds.remove(feed)
+            save_rss_feeds(self.rss_feeds)
+            logger.info(f"RSS feed silindi: {feed}")
+            self.populate_feed_list(listbox, adjustment)
+            self.update_rss()
 
     def get_title_index_at_position(self, mouse_x):
         if not self.title_pixel_positions:
@@ -370,7 +551,6 @@ class ScrollingTextWindow(Gtk.Window):
             _, _, _, _, msg_width_px, _ = cr.text_extents(self.text_with_padding)
             self.title_pixel_positions = [(0, msg_width_px)]
             self.total_text_band_width_px = msg_width_px + self.screen_width
-            #logger.debug(f"Hata mesajı piksel pozisyonu hesaplandı: {self.title_pixel_positions}. Toplam genişlik: {self.total_text_band_width_px}")
             return
 
         for i, entry in enumerate(self.entries):
@@ -397,7 +577,6 @@ class ScrollingTextWindow(Gtk.Window):
             self.next_title_index_to_speak = 0
             if self.SPEAKING_LOCK.locked():
                 logger.warning("RSS güncellendi, devam eden seslendirme olabilir.")
-            #logger.debug(f"RSS başlıkları GUI'de güncellendi. Toplam {len(self.entries)} başlık.")
         else:
             self.entries = []
             self.title_pixel_positions = []
@@ -422,15 +601,17 @@ class ScrollingTextWindow(Gtk.Window):
             cr.set_source_rgb(0, 0, 0)
         cr.paint()
 
+        if not self.text_with_padding:
+            return False  # Don't draw anything if text is empty
+
         font_size = height * 0.7
         self.set_cairo_font_settings(cr, font_size)
         fascent, fdescent, fheight, fxadvance, fyadvance = cr.font_extents()
         text_y = (height / 2) + (fheight / 2) - fdescent
 
         cr.set_source_rgb(1, 1, 1)
-        text_to_display = self.text_with_padding if self.text_with_padding else "Veri bekleniyor..."
         cr.move_to(self.x_position, text_y)
-        cr.show_text(text_to_display)
+        cr.show_text(self.text_with_padding)
         return False
 
     def update_position(self):
@@ -439,20 +620,17 @@ class ScrollingTextWindow(Gtk.Window):
 
         self.x_position -= self.speed
 
-        # Eğer şu anda bir seslendirme yapılıyorsa veya başlık yoksa, yeni tetikleme yapma
         if self.SPEAKING_LOCK.locked() or not self.entries:
             self.drawing_area.queue_draw()
             return True
 
-        # Başlık pozisyonlarını kontrol et
         if self.title_pixel_positions and self.next_title_index_to_speak < len(self.title_pixel_positions):
             start_pixel_offset, end_pixel_offset = self.title_pixel_positions[self.next_title_index_to_speak]
             title_start_screen_pos = self.x_position + start_pixel_offset
             title_end_screen_pos = self.x_position + end_pixel_offset
 
-            # Başlığın ortası ekrana geldiğinde seslendirmeyi tetikle
             title_center_screen_pos = (title_start_screen_pos + title_end_screen_pos) / 2
-            trigger_threshold = self.screen_width * 0.8  # Ekranın ortası
+            trigger_threshold = self.screen_width * 0.8
 
             if title_center_screen_pos <= trigger_threshold:
                 text_to_speak = self.entries[self.next_title_index_to_speak]['title']
@@ -474,20 +652,20 @@ class ScrollingTextWindow(Gtk.Window):
             pass
 
     def update_rss(self):
-        #logger.debug("RSS güncellemesi başlatılıyor...")
         threading.Thread(target=self.periodic_rss_fetch, daemon=True).start()
-        return True
 
     def periodic_rss_fetch(self):
-        entries = get_rss_feed()
+        if not self.network_available:
+            logger.debug("Ağ bağlantısı yok, RSS alınmadı.")
+            GLib.idle_add(self.update_text_in_gui, None)
+            return
+        entries = get_rss_feed(self.rss_feeds)
         GLib.idle_add(self.update_text_in_gui, entries)
 
 def main():
     win = ScrollingTextWindow()
     win.show_all()
-    #logger.debug("Pencere gösterildi, Gtk.main() çalışıyor.")
     Gtk.main()
-    #logger.debug("Gtk.main() sonlandı.")
 
 if __name__ == "__main__":
     main()
