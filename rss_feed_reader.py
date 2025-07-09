@@ -91,7 +91,7 @@ def speak_text(text):
             f"echo {quoted_text} | piper "
             f"--model {model_files['model']['path']} "
             f"--config {model_files['config']['path']} "
-            f"--length-scale 0.833 "
+            f"--length-scale 0.733 "
             "--output_raw"
         )
 
@@ -273,8 +273,8 @@ class ScrollingTextWindow(Gtk.Window):
         self.add(self.drawing_area)
         self.drawing_area.connect("draw", self.on_draw)
         self.drawing_area.connect("size-allocate", self.on_size_allocate)
-        self.drawing_area.set_events(self.drawing_area.get_events() | 
-                                    Gdk.EventMask.POINTER_MOTION_MASK | 
+        self.drawing_area.set_events(self.drawing_area.get_events() |
+                                    Gdk.EventMask.POINTER_MOTION_MASK |
                                     Gdk.EventMask.BUTTON_PRESS_MASK |
                                     Gdk.EventMask.LEAVE_NOTIFY_MASK)
         self.drawing_area.connect("motion-notify-event", self.on_motion_notify)
@@ -288,7 +288,10 @@ class ScrollingTextWindow(Gtk.Window):
         self.title_pixel_positions = []
         self.total_text_band_width_px = 0
         self.x_position = self.screen_width
-        self.speed = 4
+        # --- DEĞİŞİKLİK 1 (HIZ AYARI) ---
+        # Yenileme hızı arttığı için (33ms'den 16ms'ye), görsel hızın aynı kalması için
+        # hareket mesafesini (speed) düşürüyoruz.
+        self.speed = 2.5
         self.is_paused = False
         self.network_available = False
         self.initial_fetch_attempted = False
@@ -301,7 +304,10 @@ class ScrollingTextWindow(Gtk.Window):
         # Perform initial fetch in a separate thread to avoid blocking
         threading.Thread(target=self.initial_fetch, daemon=True).start()
         GLib.timeout_add(10000, self.check_network_and_fetch)  # Check every 10 seconds
-        GLib.timeout_add(33, self.update_position)
+        # --- DEĞİŞİKLİK 2 (YENİLEME HIZI) ---
+        # Animasyonun daha akıcı olması için yenileme süresini 33ms'den (~30 FPS)
+        # 16ms'ye (~60 FPS) düşürüyoruz.
+        GLib.timeout_add(16, self.update_position)
 
     def initial_fetch(self):
         # Perform initial network check and fetch
@@ -591,27 +597,41 @@ class ScrollingTextWindow(Gtk.Window):
         return False
 
     def on_draw(self, widget, cr):
+        # --- DEĞİŞİKLİK 3 (KONTRAST/GÖLGE) ---
+        # Bu metodun tamamı isteğiniz doğrultusunda güncellenmiştir.
         rect = self.get_allocation()
         width = rect.width
         height = rect.height
 
+        # Arka planı çiz
         if self.get_app_paintable():
-            cr.set_source_rgba(0, 0, 0, 0.7)
+            cr.set_source_rgba(0, 0, 0, 0.5) # Yarı şeffaf siyah
         else:
-            cr.set_source_rgb(0, 0, 0)
+            cr.set_source_rgb(0, 0, 0) # Düz siyah
         cr.paint()
 
         if not self.text_with_padding:
-            return False  # Don't draw anything if text is empty
+            return False  # Çizilecek metin yoksa devam etme
 
+        # Font ayarları
         font_size = height * 0.7
         self.set_cairo_font_settings(cr, font_size)
         fascent, fdescent, fheight, fxadvance, fyadvance = cr.font_extents()
         text_y = (height / 2) + (fheight / 2) - fdescent
+        
+        # 1. Gölgeyi çiz (Siyah renk, 1 piksel kaydırılmış)
+        # Bu, ana metnin arkasında bir kontrast katmanı oluşturarak okunurluğu artırır.
+        shadow_offset_x = 1
+        shadow_offset_y = 1
+        cr.set_source_rgb(0, 0, 0)  # Siyah gölge
+        cr.move_to(self.x_position + shadow_offset_x, text_y + shadow_offset_y)
+        cr.show_text(self.text_with_padding)
 
-        cr.set_source_rgb(1, 1, 1)
+        # 2. Ana metni çiz (Beyaz renk, orijinal pozisyon)
+        cr.set_source_rgb(1, 1, 1)  # Beyaz ana metin
         cr.move_to(self.x_position, text_y)
         cr.show_text(self.text_with_padding)
+        
         return False
 
     def update_position(self):
